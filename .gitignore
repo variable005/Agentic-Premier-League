@@ -1,0 +1,35 @@
+# Node dependency directories
+node_modules/
+frontend/node_modules/
+
+# Production builds
+frontend/dist/
+frontend/build/
+
+# Local environment files (contain API keys)
+backend/.env
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Python cache & virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+env/
+.pytest_cache/
+
+# System / IDE files
+.DS_Store
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
