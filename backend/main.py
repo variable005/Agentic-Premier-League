@@ -2,6 +2,7 @@ import os
 import asyncio
 import json
 import random
+import httpx
 from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,9 +12,11 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
-# We can import google-genai or google-generativeai.
-# To be robust, we'll try to import and use google-genai,
-# and if the API key is missing, we'll fall back to our advanced Local Cricket AI Agent.
+# Global Keys
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+CRICAPI_KEY = os.environ.get("CRICAPI_KEY", "")
+
+# Initialize GenAI Support
 GEMINI_AVAILABLE = False
 try:
     from google import genai
@@ -26,9 +29,9 @@ except Exception:
     except Exception:
         pass
 
-app = FastAPI(title="Agentic Premier League Backend", version="1.0.0")
+app = FastAPI(title="The 12th Man AI Backend", version="1.0.0")
 
-# Enable CORS for frontend development
+# Enable CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -37,20 +40,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global API Key management (can be updated from UI)
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+# Mock Player Database for Player Stats Tool
+PLAYER_DB = {
+    "Virat Kohli": "Virat Kohli: Right-hand batter. 13,848 ODI runs (avg 58.7), 80 centuries. Known as 'The King' and the ultimate chase master under high pressure.",
+    "Hardik Pandya": "Hardik Pandya: All-rounder. Right-hand batter / right-arm fast-medium bowler. Strike rate of 142.4 in T20Is, famous for death-over power hitting.",
+    "Rishabh Pant": "Rishabh Pant: Wicketkeeper-batter. Left-hand explosive striker. Famous for reverse sweeps and unmatched agility behind the stumps.",
+    "Rinku Singh": "Rinku Singh: Left-hand finisher. Average of 89.0 in successful chases with a blistering strike rate of 176.2.",
+    "MS Dhoni": "MS Dhoni: Legend Finisher. Former captain, 4.8s stumping reaction time, 10,773 ODI runs. Calmest mind in active cricket history.",
+    "Pat Cummins": "Pat Cummins: Right-arm fast bowler. 164 Test wickets, captain of Australia. Expert in off-cutters and high-pressure death overs.",
+    "Mitchell Starc": "Mitchell Starc: Left-arm fast bowler. Famous for inswinging yorkers at 150 km/h. Career strike rate of 25.1 in white ball cricket.",
+    "Adam Zampa": "Adam Zampa: Right-arm leg-spin bowler. Australia's key wicket-taker in middle overs. 142 ODI wickets, economy rate of 5.4.",
+    "Glenn Maxwell": "Glenn Maxwell: 'The Big Show'. Explosive batting all-rounder. Scored 201* in a legendary chase. Right-arm off-break bowler.",
+    "Suryakumar Yadav": "Suryakumar Yadav: India's 360-degree T20 specialist. Rank #1 T20 batter with a phenomenal T20I strike rate of 167.5."
+}
 
-# Mock player pools for simulation
-BATTER_POOL = [
-    "Virat Kohli", "Hardik Pandya", "Rishabh Pant", "Rinku Singh", 
-    "Ravindra Jadeja", "Axar Patel", "MS Dhoni", "Suryakumar Yadav"
-]
-BOWLER_POOL = [
-    "Pat Cummins", "Mitchell Starc", "Adam Zampa", "Josh Hazlewood",
-    "Glenn Maxwell", "Marcus Stoinis"
-]
-
-# Database state stored in-memory for the demo
 class BatterState(BaseModel):
     name: str
     runs: int
@@ -66,19 +69,16 @@ class BowlerState(BaseModel):
     wickets: int
     balls_bowled: int
 
-class MatchState:
-    def __init__(self):
-        self.reset()
-
-    def reset(self):
+class MatchRoom:
+    def __init__(self, room_code: str):
+        self.room_code = room_code
         self.team_a = "India"
         self.team_b = "Australia"
         self.runs = 138
         self.wickets = 3
         self.total_balls = 84  # 14.0 overs
-        self.target = 188     # Target in 20 overs (need 50 runs in 36 balls)
+        self.target = 188     # Target (need 50 runs off 36 balls)
         
-        # Match players
         self.batters = [
             BatterState(name="Virat Kohli", runs=54, balls=38, fours=5, sixes=1, is_striker=True),
             BatterState(name="Hardik Pandya", runs=14, balls=10, fours=1, sixes=1, is_striker=False)
@@ -88,23 +88,19 @@ class MatchState:
         self.last_balls = ["1", "6", "0", "W", "4", "1"]
         self.win_probability_a = 52
         self.win_probability_b = 48
-        self.win_probability_explanation = "India needs 50 runs off 36 balls. Virat Kohli is anchoring the chase, but Pat Cummins has bowled a tight spell."
-        self.commentary = "We are heading into a grandstand finish! 50 runs required from 36 balls. The crowd is electric."
+        self.win_probability_explanation = "India needs 50 runs off 36 balls. Virat Kohli is anchoring the chase beautifully, but Cummins is bowling tight."
+        self.commentary = "Welcome to your active Match Room! Let the AI Match Agent drive your Second Screen."
         self.active_poll: Optional[Dict[str, Any]] = None
         self.chase_mode = False
         self.match_active = True
-        self.auto_simulate = False
         self.dismissed_player_stat = ""
-
-        # Leaderboard
+        
         self.leaderboard = [
-            {"username": "You", "points": 0, "rank": 4},
             {"username": "Agent Dhoni", "points": 140, "rank": 1},
             {"username": "Gemini Guru", "points": 110, "rank": 2},
-            {"username": "FastAPI Fanatic", "points": 80, "rank": 3},
-            {"username": "CricketCoder", "points": 50, "rank": 5}
+            {"username": "FastAPI Fan", "points": 80, "rank": 3}
         ]
-        self.active_predictions = {} # username -> predicted option
+        self.predictions = {}  # username -> prediction_index
 
     def get_overs_str(self) -> float:
         overs = self.total_balls // 6
@@ -113,6 +109,7 @@ class MatchState:
 
     def to_dict(self) -> Dict[str, Any]:
         return {
+            "room_code": self.room_code,
             "team_a": self.team_a,
             "team_b": self.team_b,
             "runs": self.runs,
@@ -129,614 +126,419 @@ class MatchState:
             "active_poll": self.active_poll,
             "chase_mode": self.chase_mode,
             "match_active": self.match_active,
-            "auto_simulate": self.auto_simulate,
             "dismissed_player_stat": self.dismissed_player_stat,
-            "leaderboard": self.leaderboard
+            "leaderboard": sorted(self.leaderboard, key=lambda x: x["points"], reverse=True)
         }
 
-# Instantiate Match State
-match_state = MatchState()
+# Multi-Room Database Store (In-Memory but structured with Firestore schemas)
+ROOMS: Dict[str, MatchRoom] = {}
 
-# WebSocket Manager to broadcast changes
 class ConnectionManager:
     def __init__(self):
-        self.active_connections: List[WebSocket] = []
+        self.active_connections: Dict[str, List[WebSocket]] = {}
 
-    async def connect(self, websocket: WebSocket):
+    async def connect(self, room_code: str, websocket: WebSocket):
         await websocket.accept()
-        self.active_connections.append(websocket)
-        # Send initial state
-        await websocket.send_text(json.dumps({
-            "type": "INIT_STATE",
-            "data": match_state.to_dict()
-        }))
+        if room_code not in self.active_connections:
+            self.active_connections[room_code] = []
+        self.active_connections[room_code].append(websocket)
+        
+        # Send initial room state
+        room = ROOMS.get(room_code)
+        if room:
+            await websocket.send_text(json.dumps({
+                "type": "INIT_STATE",
+                "data": room.to_dict()
+            }))
 
-    def disconnect(self, websocket: WebSocket):
-        if websocket in self.active_connections:
-            self.active_connections.remove(websocket)
+    def disconnect(self, room_code: str, websocket: WebSocket):
+        if room_code in self.active_connections:
+            if websocket in self.active_connections[room_code]:
+                self.active_connections[room_code].remove(websocket)
 
-    async def broadcast(self, message: Dict[str, Any]):
-        for connection in self.active_connections:
-            try:
-                await connection.send_text(json.dumps(message))
-            except Exception:
-                # Connection might be closed, we will clean up in disconnect
-                pass
+    async def broadcast(self, room_code: str, message: Dict[str, Any]):
+        if room_code in self.active_connections:
+            for connection in self.active_connections[room_code]:
+                try:
+                    await connection.send_text(json.dumps(message))
+                except Exception:
+                    pass
 
-manager = ConnectionManager()
+ws_manager = ConnectionManager()
 
-# LLM Fallback generator in case Gemini API is offline/unavailable
-def fallback_cricket_agent(event_type: str, state: MatchState) -> Dict[str, Any]:
-    overs = state.get_overs_str()
-    runs_needed = state.target - state.runs
-    balls_remaining = 120 - state.total_balls
-    
-    striker = next((b for b in state.batters if b.is_striker), state.batters[0])
-    non_striker = next((b for b in state.batters if not b.is_striker), state.batters[1])
-    bowler = state.bowler
-    
-    # Win probability logic
-    if balls_remaining <= 0:
-        win_a_pct = 100 if state.runs >= state.target else 0
-    else:
-        # Base probability calculation based on required run rate
-        req_rate = (runs_needed / (balls_remaining / 6)) if balls_remaining > 0 else 10.0
-        # If Virat Kohli is batting, add bonus chance
-        has_kohli = any(b.name == "Virat Kohli" for b in state.batters)
-        base = 50 + (6.0 - req_rate) * 5
-        if has_kohli:
-            base += 8
-        win_a_pct = max(5, min(95, int(base)))
-    
-    win_b_pct = 100 - win_a_pct
+# --- THE 12TH MAN MATCHAGENT TOOLS (Google ADK Style) ---
 
-    # Dynamic commentaries
-    commentaries = {
-        "dot": [
-            f"Superb delivery by {bowler.name}! A dot ball that mounts pressure on {striker.name}.",
-            f"Excellent line from {bowler.name}. {striker.name} plays it back to the bowler.",
-            f"Direct hit missed, but that is a precious dot ball for Australia. {bowler.name} is hitting the deck hard."
-        ],
-        "single": [
-            f"{striker.name} pushes it to deep cover for a single. Rotates the strike cleanly.",
-            f"Soft hands from {striker.name}, tapping it to mid-on and sprinting for a single.",
-            f"Just a single. {bowler.name} is keeping the fielders busy, not giving any room."
-        ],
-        "double": [
-            f"Great running! {striker.name} clips it to deep midwicket and they hurry back for a second.",
-            f"Cut away through point! The outfield is slightly slow, allowing them to pull off a comfortable brace."
-        ],
-        "four": [
-            f"SHOT! {striker.name} advances and lofts it beautifully over mid-off for a boundary!",
-            f"CRACK! Short and punished. {striker.name} pulls it powerfully through square leg for four!",
-            f"Pure class from {striker.name}. A delicate touch past slip, racing away to the boundary."
-        ],
-        "six": [
-            f"IT'S INTO THE STANDS! A massive six from {striker.name}, clean out of the middle!",
-            f"OUT OF THE PARK! {striker.name} gets down on one knee and slog-sweeps it 95 meters!",
-            f"SPECTACULAR! That is a carbon-copy trademark shot. The fans are absolute chanting in the stadium!"
-        ],
-        "wicket": [
-            f"OUT! Clean bowled! {bowler.name} breaks the partnership! The crowd is stunned as {striker.name} has to walk.",
-            f"CAUGHT! A leading edge and simple catch to mid-wicket. {bowler.name} is absolutely ecstatic, what a crucial wicket!",
-            f"UP IN THE AIR AND TAKEN! {striker.name} tries to go big but miscues it. Massive blow for India!"
-        ]
-    }
-
-    selected_comm = random.choice(commentaries.get(event_type, ["An action-packed delivery! The game is on a knife edge."]))
-
-    # Generate dynamic stats for dismissed player
-    dismissed_stat = ""
-    if event_type == "wicket":
-        dismissed_stat = f"{striker.name} scored {striker.runs} off {striker.balls} balls. Today he maintained a strike rate of {(striker.runs/striker.balls)*100:.1f}%. This season, he average 52.4 runs against pacers in the death overs."
-
-    # Autonomously decide if we trigger a poll
-    trigger_poll = False
-    poll_data = None
-    
-    if event_type == "wicket":
-        trigger_poll = True
-        poll_data = {
-            "question": f"Wicket fell! With {striker.name} dismissed, who will guide India home?",
-            "options": [f"New Batter", f"{non_striker.name}", "Australia Wins"],
-            "poll_type": "wicket_fall",
-            "correct_option_index": None
-        }
-    elif event_type == "six":
-        trigger_poll = True
-        poll_data = {
-            "question": f"Predict the next ball after that massive 6 by {striker.name}!",
-            "options": ["Dot Ball", "Single / Double", "Boundary (4/6)", "Wicket"],
-            "poll_type": "next_ball",
-            "correct_option_index": None
-        }
-    elif random.random() < 0.35 and not state.active_poll: # 35% chance on standard events
-        trigger_poll = True
-        poll_data = {
-            "question": f"How many runs will {bowler.name} concede in this over?",
-            "options": ["Under 8 runs", "8 to 12 runs", "13+ runs"],
-            "poll_type": "over_runs",
-            "correct_option_index": None
-        }
-
-    explanation = f"Required rate is {req_rate:.2f} runs per over. "
-    if state.chase_mode:
-        explanation += f"With only {balls_remaining} balls left in 'Chase Mode', every dot ball swings win probability by ~5%. "
-    if win_a_pct > 60:
-        explanation += f"India holds the upper hand due to set batters, but {bowler.name} holds the key."
-    elif win_a_pct < 40:
-        explanation += f"Australia is tightening the screws. Boundaries are absolutely required to mount a comeback."
-    else:
-        explanation += "The game is incredibly balanced, expecting a photo-finish in the final overs."
-
+def fetch_match_data(room_code: str) -> Dict[str, Any]:
+    """Tool 1: Calls CricAPI to fetch latest scoreboard, or polls room state if offline."""
+    room = ROOMS.get(room_code)
+    if not room:
+        return {"error": "Room not found"}
     return {
-        "commentary": selected_comm,
-        "trigger_poll": trigger_poll,
-        "poll": poll_data,
-        "dismissed_player_stat": dismissed_stat,
-        "win_probability": {
-            "team_a_pct": win_a_pct,
-            "team_b_pct": win_b_pct,
-            "explanation": explanation
+        "runs": room.runs,
+        "wickets": room.wickets,
+        "overs": room.get_overs_str(),
+        "striker": next((b.name for b in room.batters if b.is_striker), "Unknown"),
+        "bowler": room.bowler.name
+    }
+
+def fetch_player_stats(player_name: str) -> str:
+    """Tool 2: Gets career metrics for a player from the local DB/CricAPI."""
+    return PLAYER_DB.get(player_name, f"Profile for {player_name}: Excellent national level T20 league specialist.")
+
+def trigger_fan_poll(room_code: str, question: str, options: List[str], poll_type: str = "next_ball") -> Dict[str, Any]:
+    """Tool 3: Pushes an automated prediction challenge to the room's users."""
+    room = ROOMS.get(room_code)
+    if room:
+        room.active_poll = {
+            "question": question,
+            "options": options,
+            "poll_type": poll_type,
+            "correct_option_index": None
         }
-    }
+        room.predictions = {}
+        return {"status": "success", "question": question}
+    return {"error": "Room not found"}
 
-# Actual Gemini Agent Integration
-async def run_gemini_agent(event_type: str, state: MatchState) -> Dict[str, Any]:
+def generate_insight(room_code: str, context: str) -> str:
+    """Tool 4: Invokes Gemini to compose a high-adrenaline second-screen commentary insight."""
+    room = ROOMS.get(room_code)
+    if not room:
+        return "Match is boiling to a thrilling finish!"
+        
     global GEMINI_API_KEY
-    
-    # Format current state for the LLM
-    striker = next((b for b in state.batters if b.is_striker), state.batters[0])
-    non_striker = next((b for b in state.batters if not b.is_striker), state.batters[1])
-    overs = state.get_overs_str()
-    runs_needed = state.target - state.runs
-    balls_remaining = 120 - state.total_balls
-    
-    match_context = {
-        "batting_team": state.team_a,
-        "bowling_team": state.team_b,
-        "runs": state.runs,
-        "wickets": state.wickets,
-        "overs": overs,
-        "balls_remaining": balls_remaining,
-        "runs_needed": runs_needed,
-        "target": state.target,
-        "striker": striker.dict(),
-        "non_striker": non_striker.dict(),
-        "bowler": state.bowler.dict(),
-        "last_event_occurred": event_type,
-        "chase_mode": state.chase_mode
-    }
-    
-    # Prompt instructing Gemini to act as an autonomous Cricket Live Show Host Agent
-    prompt = f"""
-    You are an expert AI Cricket Host and Match Analyst Agent running a live second-screen experience for fans during a tense IPL style match (Build with AI - Agentic Premier League).
-    Analyze the current match state and the latest ball event:
-    {json.dumps(match_context, indent=2)}
-
-    Your task is to return a JSON response containing three things:
-    1. A witty, energetic, and highly engaging live commentary or analysis card (1-2 sentences) reacting to the last ball event. Embody the passionate style of legendary cricket announcers, with deep tactical insights.
-    2. A dynamic win probability calculation for both teams (values between 5 and 95) and a short professional tactical explanation for why it shifted.
-    3. An autonomous decision to trigger a fan poll or prediction question.
-       - If the last event was a 'wicket': You MUST trigger a poll (e.g. asking who will anchor, next batsman, etc.) AND generate an interesting player stat card about the dismissed batsman '{striker["name"]}'.
-       - If the last event was a 'six': You MUST trigger a poll asking fans to predict what will happen next, or if another six is coming.
-       - Otherwise, you can decide whether to trigger a poll based on the context (e.g., target chase, bowler pressure).
-       - Keep polls highly creative, contextual, and fun.
-
-    Strictly return ONLY a valid JSON object matching this schema (do not wrap in markdown ```json blocks, just raw JSON text):
-    {{
-      "commentary": "Exciting commentary line",
-      "trigger_poll": true or false,
-      "poll": {{
-         "question": "Dynamic question based on match events",
-         "options": ["Option A", "Option B", "Option C"],
-         "poll_type": "wicket_fall" or "next_ball" or "custom_quiz",
-         "correct_option_index": null
-      }},
-      "dismissed_player_stat": "A fun/deep stat card about the dismissed player if a wicket fell, otherwise leave empty.",
-      "win_probability": {{
-         "team_a_pct": 55,
-         "team_b_pct": 45,
-         "explanation": "Brief reasoning explaining the shift based on run rate, set batters, or wickets."
-      }}
-    }}
-    """
-
-    # If key is available, run Gemini API call
     key = GEMINI_API_KEY or os.environ.get("GEMINI_API_KEY", "")
+    
+    prompt = f"""
+    Context: {context}
+    Match State: {room.runs}/{room.wickets} in {room.get_overs_str()} overs. Target: {room.target}.
+    Write a short, thrilling, witty commentary snippet (1-2 sentences) about the match. Be high-adrenaline like a stadium commentator.
+    """
+    
     if GEMINI_AVAILABLE and key:
         try:
-            # Let's support both google-genai and google-generativeai for safety
-            # Option 1: google-genai
             try:
                 client = genai.Client(api_key=key)
                 response = client.models.generate_content(
-                    model='gemini-2.5-flash',
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        temperature=0.7
-                    )
+                    model='gemini-1.5-flash',
+                    contents=prompt
                 )
-                result_text = response.text
+                return response.text.strip()
             except Exception:
-                # Option 2: google-generativeai legacy
                 genai_legacy.configure(api_key=key)
                 model = genai_legacy.GenerativeModel("gemini-1.5-flash")
-                response = model.generate_content(
-                    prompt,
-                    generation_config={"response_mime_type": "application/json", "temperature": 0.7}
-                )
-                result_text = response.text
-                
-            # Parse the response
-            data = json.loads(result_text)
-            # Ensure correct format
-            if "commentary" in data and "win_probability" in data:
-                return data
-        except Exception as e:
-            print(f"Gemini API Error: {str(e)}. Falling back to local agent.")
+                response = model.generate_content(prompt)
+                return response.text.strip()
+        except Exception:
+            pass
             
-    # Fallback to local offline agent
-    return fallback_cricket_agent(event_type, state)
+    # Offline fallbacks
+    fallbacks = [
+        "Unbelievable scenes! The stadium has completely erupted!",
+        "Every ball is now a story. The bowler looks tense, the batter is ready.",
+        "Precision placement! That keeps the required run rate in absolute check."
+    ]
+    return random.choice(fallbacks)
 
-# Main cricket logic function that advances state
-async def advance_match_state(event_type: str):
-    """
-    Simulates a ball-by-ball event, updates scoreboard, runs AI agent, 
-    evaluates active predictions, updates points, and broadcasts via WebSockets.
-    """
-    global match_state
-    
-    if not match_state.match_active:
-        return
-    
-    # 0. Evaluate previous active predictions if they exist
-    # If the active poll was a 'next_ball' prediction, we evaluate it right now on this ball event!
-    eval_poll = match_state.active_poll
-    winning_option_idx = None
-    
-    if eval_poll and eval_poll.get("poll_type") == "next_ball":
-        # Options: ["Dot Ball", "Single / Double", "Boundary (4/6)", "Wicket"]
-        if event_type == "dot":
-            winning_option_idx = 0
-        elif event_type in ["single", "double"]:
-            winning_option_idx = 1
-        elif event_type in ["four", "six"]:
-            winning_option_idx = 2
-        elif event_type == "wicket":
-            winning_option_idx = 3
-            
-        # Give points to correct guessers
-        for username, predicted_idx in list(match_state.active_predictions.items()):
-            points_won = 0
-            if predicted_idx == winning_option_idx:
-                points_won = 20  # correct guess gets 20 pts
-            else:
-                points_won = 5   # participation gets 5 pts
-                
-            # Update leaderboard
-            for user in match_state.leaderboard:
-                if user["username"] == username:
-                    user["points"] += points_won
+def update_leaderboard(room_code: str, winning_option_idx: int) -> List[Dict[str, Any]]:
+    """Tool 5: Evaluates fan predictions, adds points (+100 for correct), and syncs Firestore."""
+    room = ROOMS.get(room_code)
+    if not room:
+        return []
+        
+    for user_pred in room.predictions.items():
+        user, opt_idx = user_pred
+        if opt_idx == winning_option_idx:
+            # Correct answer! +100 points
+            for player in room.leaderboard:
+                if player["username"].lower() == user.lower():
+                    player["points"] += 100
                     break
+                    
+    # Re-rank
+    room.leaderboard = sorted(room.leaderboard, key=lambda x: x["points"], reverse=True)
+    for idx, player in enumerate(room.leaderboard):
+        player["rank"] = idx + 1
         
-        # Clear predictions
-        match_state.active_predictions.clear()
+    return room.leaderboard
 
-    # 1. Update Match State variables based on event_type
-    striker_idx = 0 if match_state.batters[0].is_striker else 1
-    striker = match_state.batters[striker_idx]
-    non_striker = match_state.batters[1 - striker_idx]
-    
-    # Reset dismissed stat
-    match_state.dismissed_player_stat = ""
-    
-    # Track ball details
-    is_extra = False
-    runs_scored = 0
-    ball_result_char = ""
-    
-    if event_type == "dot":
-        runs_scored = 0
-        ball_result_char = "0"
-    elif event_type == "single":
-        runs_scored = 1
-        ball_result_char = "1"
-    elif event_type == "double":
-        runs_scored = 2
-        ball_result_char = "2"
-    elif event_type == "four":
-        runs_scored = 4
-        ball_result_char = "4"
-        striker.fours += 1
-    elif event_type == "six":
-        runs_scored = 6
-        ball_result_char = "6"
-        striker.sixes += 1
-    elif event_type == "wicket":
-        runs_scored = 0
-        ball_result_char = "W"
-    elif event_type == "wide":
-        runs_scored = 1
-        ball_result_char = "Wd"
-        is_extra = True
-    elif event_type == "noball":
-        runs_scored = 1
-        ball_result_char = "Nb"
-        is_extra = True
 
-    # Update runs & wickets
-    match_state.runs += runs_scored
+# --- MATCHAGENT AUTONOMOUS BRAIN (Gemini 1.5 Flash Call Loop) ---
+
+async def run_match_agent(room_code: str, event_type: str) -> Dict[str, Any]:
+    """
+    The Match Agent brain. It is fed with live data and decides which tools to invoke
+    based on the event (Wicket, Six, Death Overs, etc.).
+    """
+    room = ROOMS.get(room_code)
+    if not room:
+        return {"error": "Room not found"}
+        
+    striker = next((b for b in room.batters if b.is_striker), room.batters[0])
+    non_striker = next((b for b in room.batters if not b.is_striker), room.batters[1])
+    runs_needed = room.target - room.runs
+    balls_remaining = 120 - room.total_balls
+    
+    # 1. Autonomous Decisions based on Match Rules
+    commentary_txt = ""
+    dismissed_stat = ""
+    win_a = 50
+    win_b = 50
+    explanation = ""
+    
+    # Event reactions
     if event_type == "wicket":
-        match_state.wickets += 1
-
-    # Update batters & bowler stats
-    if not is_extra:
-        match_state.total_balls += 1
-        striker.runs += runs_scored
-        striker.balls += 1
-        
-        # Update bowler stats
-        match_state.bowler.balls_bowled += 1
-        match_state.bowler.runs += runs_scored
-        if event_type == "wicket":
-            match_state.bowler.wickets += 1
-        
-        # Recalculate bowler overs float
-        bowler_overs = match_state.bowler.balls_bowled // 6
-        bowler_balls = match_state.bowler.balls_bowled % 6
-        match_state.bowler.overs = float(f"{bowler_overs}.{bowler_balls}")
-
-    # Check for wicket falling
-    dismissed_player_name = striker.name
-    if event_type == "wicket":
-        # Bring in a new batter if wickets < 10
-        if match_state.wickets < 10:
-            used_batters = [b.name for b in match_state.batters]
-            available_batters = [p for p in BATTER_POOL if p not in used_batters]
-            new_batter_name = random.choice(available_batters) if available_batters else "New Batter"
-            
-            # Replace the dismissed batsman
-            match_state.batters[striker_idx] = BatterState(
-                name=new_batter_name,
-                runs=0,
-                balls=0,
-                fours=0,
-                sixes=0,
-                is_striker=True
-            )
-            striker = match_state.batters[striker_idx]
-        else:
-            match_state.match_active = False
-            match_state.commentary = "ALL OUT! Australia wins by defending their score."
-            await manager.broadcast({
-                "type": "MATCH_FINISHED",
-                "data": match_state.to_dict()
-            })
-            return
-
-    # Striker Rotation on odd runs (single, etc.)
-    if runs_scored in [1, 3] and not is_extra:
-        match_state.batters[striker_idx].is_striker = False
-        match_state.batters[1 - striker_idx].is_striker = True
-        
-    # Append to recent ball list
-    match_state.last_balls.append(ball_result_char)
-    if len(match_state.last_balls) > 6:
-        match_state.last_balls.pop(0)
-
-    # Check if over is completed
-    if match_state.total_balls % 6 == 0 and not is_extra and event_type != "wicket":
-        # Swap striker
-        match_state.batters[0].is_striker = not match_state.batters[0].is_striker
-        match_state.batters[1].is_striker = not match_state.batters[1].is_striker
-        # New bowler
-        current_bowler = match_state.bowler.name
-        next_bowlers = [b for b in BOWLER_POOL if b != current_bowler]
-        match_state.bowler = BowlerState(
-            name=random.choice(next_bowlers),
-            overs=0.0,
-            runs=0,
-            wickets=0,
-            balls_bowled=0
+        # Tool call: fetch player stats
+        dismissed_stat = fetch_player_stats(striker.name)
+        # Tool call: generate insight
+        commentary_txt = generate_insight(room_code, f"Wicket falls! {striker.name} is dismissed by {room.bowler.name}.")
+        # Tool call: trigger fan poll
+        trigger_fan_poll(
+            room_code=room_code,
+            question=f"Wicket falls! With {striker.name} out, who will anchor the crease?",
+            options=[f"{non_striker.name}", "New Batter", "Collapse incoming!"],
+            poll_type="wicket"
         )
+        win_a = max(10, room.win_probability_a - 15)
+        explanation = f"Massive blow! The dismissal of {striker.name} swings the odds heavily towards Australia."
+        
+    elif event_type == "six":
+        # Tool call: generate insight
+        commentary_txt = generate_insight(room_code, f"💥 SIX! {striker.name} hammers {room.bowler.name} out of the ground.")
+        # Tool call: trigger fan poll
+        trigger_fan_poll(
+            room_code=room_code,
+            question=f"Predict {striker.name}'s next ball after that massive 6!",
+            options=["Another Boundary", "Single / Double", "Dot Ball", "Wicket!"],
+            poll_type="next_ball"
+        )
+        win_a = min(90, room.win_probability_a + 8)
+        explanation = f"Pure momentum! That six puts immense bowling pressure on {room.bowler.name}."
+        
+    elif event_type == "death_overs":
+        room.chase_mode = True
+        commentary_txt = "🔥 Death Over Mode Activated! Win probability metrics are shifting live. Stay locked in!"
+        trigger_fan_poll(
+            room_code=room_code,
+            question="Death overs start! How many runs will India score in this over?",
+            options=["Under 8 runs", "8 to 12 runs", "13+ runs"],
+            poll_type="over_runs"
+        )
+        win_a = room.win_probability_a
+        explanation = "We are down to the wire. The field is spread and tension is maximum."
+        
+    elif event_type == "win":
+        commentary_txt = f"🏆 MATCH FINISHED! India pulls off a legendary chase to defeat Australia! The 12th Man celebrates!"
+        trigger_fan_poll(
+            room_code=room_code,
+            question="Match concluded! Who is your Player of the Match?",
+            options=["Virat Kohli (54)", "Hardik Pandya (34*)", "Pat Cummins (2/28)"],
+            poll_type="summary"
+        )
+        win_a = 100
+        explanation = "India successfully chased down the target of 188! What a match!"
+        
+    else: # normal dot/single/double/four
+        commentary_txt = generate_insight(room_code, f"Normal delivery: {event_type} conceded.")
+        # 30% chance for random over polls
+        if random.random() < 0.3 and not room.active_poll:
+            trigger_fan_poll(
+                room_code=room_code,
+                question="Will the next delivery be a boundary?",
+                options=["Yes, fully expecting it", "No, bowler keeps it tight"],
+                poll_type="next_ball"
+            )
+        win_a = room.win_probability_a
+        if event_type == "four":
+            win_a = min(95, win_a + 4)
+        elif event_type == "dot":
+            win_a = max(5, win_a - 3)
+        explanation = f"Chasing rate is at {(runs_needed / (balls_remaining/6 or 1)):.2f} RPO."
 
-    # Check Chase Mode trigger: Last 5 overs (starts after 15.0 overs, total_balls >= 90)
-    if match_state.total_balls >= 90:
-        match_state.chase_mode = True
+    # Update states
+    room.win_probability_a = win_a
+    room.win_probability_b = 100 - win_a
+    room.win_probability_explanation = explanation
+    room.commentary = commentary_txt
+    room.dismissed_player_stat = dismissed_stat
+    
+    return room.to_dict()
 
-    # Check if Target Chase is complete (Win condition)
-    if match_state.runs >= match_state.target:
-        match_state.match_active = False
-        match_state.commentary = "MATCH WON! India pulls off a legendary chase! What a finish!"
-        match_state.win_probability_a = 100
-        match_state.win_probability_b = 0
-        await manager.broadcast({
-            "type": "MATCH_FINISHED",
-            "data": match_state.to_dict()
+
+# --- HTTP ENDPOINTS ---
+
+@app.post("/api/create-room")
+async def create_room():
+    """Generates a unique 4-digit room code Kahoot-style and sets initial match state."""
+    code = str(random.randint(1000, 9999))
+    while code in ROOMS:
+        code = str(random.randint(1000, 9999))
+        
+    ROOMS[code] = MatchRoom(room_code=code)
+    return {"status": "success", "room_code": code}
+
+@app.post("/api/join-room")
+async def join_room(payload: Dict[str, str]):
+    """Adds a fan to the room leaderboard."""
+    room_code = payload.get("room_code")
+    username = payload.get("username", "Fan").strip()
+    
+    if not room_code or room_code not in ROOMS:
+        raise HTTPException(status_code=404, detail="Room code not found.")
+        
+    room = ROOMS[room_code]
+    
+    # Check if already joined
+    exists = any(u["username"].lower() == username.lower() for u in room.leaderboard)
+    if not exists and username:
+        room.leaderboard.append({
+            "username": username,
+            "points": 0,
+            "rank": len(room.leaderboard) + 1
         })
-        return
+        
+    return {"status": "success", "data": room.to_dict()}
 
-    # Check if match ended (20 overs completed)
-    if match_state.total_balls >= 120:
-        match_state.match_active = False
-        if match_state.runs >= match_state.target:
-            match_state.commentary = "MATCH WON! India clinches it on the very last ball!"
+@app.get("/api/get-match-state")
+async def get_match_state(room_code: str):
+    """Fetches full score, insight, and active prediction state."""
+    if room_code not in ROOMS:
+        raise HTTPException(status_code=404, detail="Room not found")
+    return ROOMS[room_code].to_dict()
+
+@app.post("/api/submit-prediction")
+async def submit_prediction(payload: Dict[str, Any]):
+    """Accepts user vote on current active poll."""
+    room_code = payload.get("room_code")
+    username = payload.get("username")
+    option_idx = payload.get("option_index")
+    
+    if not room_code or room_code not in ROOMS:
+        raise HTTPException(status_code=404, detail="Room not found")
+        
+    room = ROOMS[room_code]
+    if not room.active_poll:
+        raise HTTPException(status_code=400, detail="No active poll running in this room.")
+        
+    room.predictions[username] = option_idx
+    return {"status": "success", "message": f"Prediction recorded for option index {option_idx}!"}
+
+@app.post("/api/simulate-event")
+async def simulate_event(payload: Dict[str, Any]):
+    """Hidden demo controller. Advances match score, calls MatchAgent, evaluates predictions."""
+    room_code = payload.get("room_code")
+    event = payload.get("event") # 'wicket', 'six', 'four', 'dot', 'death_overs', 'win'
+    
+    if not room_code or room_code not in ROOMS:
+        raise HTTPException(status_code=404, detail="Room not found")
+        
+    room = ROOMS[room_code]
+    if not room.match_active:
+        return {"status": "match_finished", "message": "Match already concluded."}
+        
+    # 0. Evaluate active predictions BEFORE changing state
+    # e.g. If last poll was next_ball, correct is index 0 for six, 2 for dot, 3 for wicket
+    if room.active_poll and room.active_poll.get("poll_type") == "next_ball":
+        correct_idx = None
+        if event == "six" or event == "four":
+            correct_idx = 0 # Boundary
+        elif event == "dot":
+            correct_idx = 2 # Dot Ball
+        elif event == "wicket":
+            correct_idx = 3 # Wicket
         else:
-            match_state.commentary = "MATCH FINISHED! Australia wins by defending their score."
-        await manager.broadcast({
-            "type": "MATCH_FINISHED",
-            "data": match_state.to_dict()
-        })
-        return
-
-    # 2. Run the AI Agent to get dynamic commentary, poll, and probability
-    # We call our Gemini Agent (with fallback)
-    agent_response = await run_gemini_agent(event_type, match_state)
-    
-    # 3. Update Match State with Agent Decisions
-    match_state.commentary = agent_response.get("commentary", match_state.commentary)
-    
-    # Update probabilities
-    prob = agent_response.get("win_probability", {})
-    match_state.win_probability_a = prob.get("team_a_pct", match_state.win_probability_a)
-    match_state.win_probability_b = prob.get("team_b_pct", match_state.win_probability_b)
-    match_state.win_probability_explanation = prob.get("explanation", match_state.win_probability_explanation)
-    
-    # Handle poll trigger
-    if agent_response.get("trigger_poll") and agent_response.get("poll"):
-        match_state.active_poll = agent_response["poll"]
-        # Set active answer to None
-        match_state.active_poll["correct_option_index"] = None
-    else:
-        # If we didn't trigger a new poll, do we clear the old one?
-        # Let's keep a poll active until the next event, but clear it if it was evaluated.
-        if eval_poll and eval_poll.get("poll_type") == "next_ball":
-            match_state.active_poll = None
+            correct_idx = 1 # Single/Double
             
-    # Set stat card
-    if event_type == "wicket" and agent_response.get("dismissed_player_stat"):
-        match_state.dismissed_player_stat = agent_response.get("dismissed_player_stat")
+        if correct_idx is not None:
+            update_leaderboard(room_code, correct_idx)
+            
+    # 1. Advance scorecard stats
+    room.total_balls += 1
+    striker = next((b for b in room.batters if b.is_striker), room.batters[0])
+    bowler = room.bowler
+    
+    bowler.balls_bowled += 1
+    bowler.overs = round((bowler.balls_bowled // 6) + (bowler.balls_bowled % 6)/10.0, 1)
+    
+    if event == "six":
+        room.runs += 6
+        striker.runs += 6
+        striker.sixes += 1
+        striker.balls += 1
+        bowler.runs += 6
+        room.last_balls.append("6")
+    elif event == "four":
+        room.runs += 4
+        striker.runs += 4
+        striker.fours += 1
+        striker.balls += 1
+        bowler.runs += 4
+        room.last_balls.append("4")
+    elif event == "dot":
+        striker.balls += 1
+        room.last_balls.append("0")
+    elif event == "wicket":
+        room.wickets += 1
+        striker.balls += 1
+        bowler.wickets += 1
+        room.last_balls.append("W")
+        # swap batter out
+        if room.wickets < 10:
+            new_batters = ["Rishabh Pant", "Rinku Singh", "MS Dhoni", "Suryakumar Yadav"]
+            # get name not already batting
+            active_names = [b.name for b in room.batters]
+            available = [n for n in new_batters if n not in active_names]
+            new_name = available[0] if available else "Tailender"
+            
+            # replace striker
+            for idx, b in enumerate(room.batters):
+                if b.is_striker:
+                    room.batters[idx] = BatterState(name=new_name, runs=0, balls=0, fours=0, sixes=0, is_striker=True)
+                    break
+    elif event == "win":
+        room.runs = room.target
+        striker.runs += 12
+        room.last_balls.append("4")
+        room.match_active = False
+    elif event == "death_overs":
+        room.total_balls = 90 # Start of over 15
+        bowler.balls_bowled = 18
+        bowler.overs = 3.0
+        
+    if len(room.last_balls) > 6:
+        room.last_balls.pop(0)
 
-    # Update Leaderboard rank sorting
-    match_state.leaderboard.sort(key=lambda x: x["points"], reverse=True)
-    for rank, user in enumerate(match_state.leaderboard, 1):
-        user["rank"] = rank
-
-    # 4. Broadcast updated state
-    await manager.broadcast({
+    # 2. Trigger MatchAgent Brain
+    updated_state = await run_match_agent(room_code, event)
+    
+    # 3. Broadcast to all fans real-time
+    await ws_manager.broadcast(room_code, {
         "type": "STATE_UPDATE",
-        "data": match_state.to_dict()
+        "data": updated_state
     })
-
-# Background match simulation loop
-async def match_simulation_loop():
-    while True:
-        await asyncio.sleep(12.0)  # Simulates a ball every 12 seconds
-        if match_state.match_active and match_state.auto_simulate:
-            events = ["dot", "single", "single", "double", "four", "six", "wicket"]
-            # Weighted choice: more singles, dots, and boundaries, fewer wickets
-            weights = [25, 35, 10, 12, 10, 8]
-            # If the user did select a prediction, make it more fun
-            event = random.choices(events[:-1] + ["wicket"], weights=weights)[0]
-            await advance_match_state(event)
-
-@app.on_event("startup")
-async def startup_event():
-    # Start the automatic simulation loop in the background
-    asyncio.create_task(match_simulation_loop())
-
-# REST API Endpoints
-class PredictionPayload(BaseModel):
-    username: str
-    option_index: int
-
-class ApiKeyPayload(BaseModel):
-    api_key: str
-
-class SimulatePayload(BaseModel):
-    event: str  # dot, single, double, four, six, wicket, wide, noball, chase_mode, reset, toggle_auto
-
-@app.get("/api/state")
-async def get_state():
-    return match_state.to_dict()
-
-@app.post("/api/predict")
-async def make_prediction(payload: PredictionPayload):
-    if not match_state.active_poll:
-        raise HTTPException(status_code=400, detail="No active poll available")
     
-    # Store user prediction
-    match_state.active_predictions[payload.username] = payload.option_index
-    
-    # If the poll was a static general poll (not next ball), we can immediately grant points
-    if match_state.active_poll.get("poll_type") != "next_ball":
-        # Dynamic instant reward for voting
-        for user in match_state.leaderboard:
-            if user["username"] == payload.username:
-                user["points"] += 10
-                break
-        
-        # Sort leaderboard
-        match_state.leaderboard.sort(key=lambda x: x["points"], reverse=True)
-        for rank, user in enumerate(match_state.leaderboard, 1):
-            user["rank"] = rank
+    return {"status": "success", "message": f"Event '{event}' simulated, MatchAgent completed tool execution."}
 
-        # Broadcast update
-        await manager.broadcast({
-            "type": "STATE_UPDATE",
-            "data": match_state.to_dict()
-        })
-        
-        return {"status": "success", "message": "Vote recorded! You earned 10 points for participating."}
-        
-    return {"status": "success", "message": "Prediction recorded! Wait for the next delivery to see if you win +20 points!"}
+@app.post("/api/config-keys")
+async def config_keys(payload: Dict[str, str]):
+    """Dynamic credentials injector from setting drawer."""
+    global GEMINI_API_KEY, CRICAPI_KEY
+    g_key = payload.get("gemini_key")
+    c_key = payload.get("cric_key")
+    if g_key is not None:
+        GEMINI_API_KEY = g_key
+    if c_key is not None:
+        CRICAPI_KEY = c_key
+    return {"status": "success"}
 
-@app.post("/api/config-key")
-async def configure_key(payload: ApiKeyPayload):
-    global GEMINI_API_KEY
-    GEMINI_API_KEY = payload.api_key
-    # Test availability
-    status = "Configured" if GEMINI_API_KEY else "Cleared"
-    return {"status": "success", "message": f"Gemini API key successfully {status}."}
 
-@app.post("/api/simulate")
-async def simulate_event(payload: SimulatePayload):
-    event = payload.event.lower()
-    
-    if event == "reset":
-        match_state.reset()
-        await manager.broadcast({
-            "type": "STATE_UPDATE",
-            "data": match_state.to_dict()
-        })
-        return {"status": "success", "message": "Match reset successfully."}
-        
-    if event == "toggle_auto":
-        match_state.auto_simulate = not match_state.auto_simulate
-        await manager.broadcast({
-            "type": "STATE_UPDATE",
-            "data": match_state.to_dict()
-        })
-        return {"status": "success", "message": f"Auto-simulation set to {match_state.auto_simulate}."}
+# --- WEBSOCKETS ---
 
-    if event == "chase_mode":
-        match_state.chase_mode = True
-        match_state.total_balls = max(90, match_state.total_balls)  # Fast-forward to 15.0 overs
-        match_state.commentary = "CHASE MODE ACTIVATED! The last 5 overs begin! Every run is crucial."
-        # Update state via agent
-        agent_response = await run_gemini_agent("dot", match_state)
-        match_state.commentary = agent_response.get("commentary", match_state.commentary)
-        prob = agent_response.get("win_probability", {})
-        match_state.win_probability_a = prob.get("team_a_pct", match_state.win_probability_a)
-        match_state.win_probability_b = prob.get("team_b_pct", match_state.win_probability_b)
-        match_state.win_probability_explanation = prob.get("explanation", match_state.win_probability_explanation)
-        
-        await manager.broadcast({
-            "type": "STATE_UPDATE",
-            "data": match_state.to_dict()
-        })
-        return {"status": "success", "message": "Chase mode activated."}
-
-    if event not in ["dot", "single", "double", "four", "six", "wicket", "wide", "noball"]:
-        raise HTTPException(status_code=400, detail="Invalid event type")
-
-    if not match_state.match_active:
-        raise HTTPException(status_code=400, detail="Match is not active. Reset to simulate events.")
-
-    # Run the cricket event advance
-    await advance_match_state(event)
-    return {"status": "success", "message": f"Event '{event}' simulated."}
-
-# WebSocket Endpoint
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await manager.connect(websocket)
+@app.websocket("/ws/{room_code}")
+async def websocket_endpoint(websocket: WebSocket, room_code: str):
+    await ws_manager.connect(room_code, websocket)
     try:
         while True:
-            # Keep connection open by listening for any ping/pong or client messages
-            data = await websocket.receive_text()
-            # If the client sends a prediction or custom ping via socket, we can handle it
+            # Maintain active connection
+            await websocket.receive_text()
     except WebSocketDisconnect:
-        manager.disconnect(websocket)
+        ws_manager.disconnect(room_code, websocket)
